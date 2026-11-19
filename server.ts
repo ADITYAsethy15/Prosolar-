@@ -162,8 +162,10 @@ const MODEL_ERROR_REGEX =
 const SYSTEM_INSTRUCTION_UNSUPPORTED_REGEX =
   /(developer instruction is not enabled|system[_ ]instruction|system role is not supported|developer role is not supported)/i;
 
+const URL_CONTEXT_ERROR_REGEX = /(url_context|urlcontext|tools|tool_use)/i;
+
 const PARAMETER_ERROR_REGEX =
-  /(thinking|thinkingconfig|thinking_level|reasoning|reasoning_effort|reasoning_format|include_reasoning|chat_template_kwargs|temperature|top_p|top_k|max_tokens|max_completion_tokens|developer instruction|system[_ ]instruction|provider|extra_forbidden|additional properties|unrecognized|unsupported parameter|unknown field|invalid value|cannot be used with|not supported for this model|invalid argument|invalid)/i;
+  /(thinking|thinkingconfig|thinking_level|reasoning|reasoning_effort|reasoning_format|include_reasoning|chat_template_kwargs|temperature|top_p|top_k|max_tokens|max_completion_tokens|developer instruction|system[_ ]instruction|url_context|urlcontext|tools|tool_use|provider|extra_forbidden|additional properties|unrecognized|unsupported parameter|unknown field|invalid value|cannot be used with|not supported for this model|invalid argument|invalid)/i;
 
 function isParameterRejection(status: number, message: string): boolean {
   if ([401, 402, 403, 429].includes(status)) return false;
@@ -652,6 +654,63 @@ function resolveSdkThinkingConfig(rawConfig?: Record<string, unknown>): Record<s
   return out;
 }
 
+function hasPublicHttpUrl(messages: MessageInput[]): boolean {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role !== 'user') continue;
+    const raw = String(messages[i]?.text ?? messages[i]?.content ?? '').split(
+      /\n\n---\n\[Web Search Results for /
+    )[0];
+    const matches = raw.match(/https?:\/\/[^\s<>"'`)\]]+/gi) || [];
+    for (const candidate of matches) {
+      try {
+        const u = new URL(candidate.replace(/[.,;!?]+$/, ''));
+        if (!['http:', 'https:'].includes(u.protocol)) continue;
+        const host = u.hostname.toLowerCase();
+        if (
+          !host ||
+          host === 'localhost' ||
+          host === '0.0.0.0' ||
+          host === '::1' ||
+          host.endsWith('.local') ||
+          host.endsWith('.internal') ||
+          /^(?:127\.|10\.|192\.168\.|169\.254\.|172\.(?:1[6-9]|2\d|3[01])\.)/.test(host) ||
+          !host.includes('.')
+        ) {
+          continue;
+        }
+        return true;
+      } catch {
+        // Ignore malformed URL candidates
+      }
+    }
+    return false;
+  }
+  return false;
+}
+
+function safelyReadCandidateUrlCitations(candidate: any, seenUrls: Set<string>): void {
+  try {
+    const groundingChunks = candidate?.groundingMetadata?.groundingChunks;
+    if (Array.isArray(groundingChunks)) {
+      for (const ch of groundingChunks) {
+        const uri = ch?.web?.uri || ch?.retrievedContext?.uri;
+        if (typeof uri === 'string' && uri.trim()) seenUrls.add(uri.trim());
+      }
+    }
+    const urlMeta = candidate?.urlContextMetadata?.urlMetadata;
+    if (Array.isArray(urlMeta)) {
+      for (const item of urlMeta) {
+        const retrievedUrl = item?.retrievedUrl || item?.retrieved_url;
+        if (typeof retrievedUrl === 'string' && retrievedUrl.trim()) {
+          seenUrls.add(retrievedUrl.trim());
+        }
+      }
+    }
+  } catch {
+    // Safely ignore unexpected citation metadata shapes
+  }
+}
+
 async function runGeminiModel(options: {
   model: string;
   apiKey: string;
@@ -692,9 +751,12 @@ async function runGeminiModel(options: {
   });
 
   const modelLower = model.trim().toLowerCase();
-  const isLegacyGemma = modelLower.startsWith('gemma') && !modelLower.startsWith('gemma-4');
+  const isGemmaFamily = modelLower.startsWith('gemma');
+  const isLegacyGemma = isGemmaFamily && !modelLower.startsWith('gemma-4');
   let systemAsUser = Boolean(capability?.systemAsUser) || isLegacyGemma;
   let learnedSystemAsUser = false;
+  let useUrlContext = !isGemmaFamily && hasPublicHttpUrl(messages);
+  let strippedUrlContextOnRetry = false;
 
   let contents = formatMessagesForGemini(messages, historyLimit, systemPrompt, systemAsUser);
   const attempts = buildGeminiThinkingAttempts(model, thinkingLevel, capability);
@@ -719,6 +781,9 @@ async function runGeminiModel(options: {
     if (resolvedThinking) {
       config.thinkingConfig = resolvedThinking;
     }
+    if (useUrlContext) {
+      config.tools = [{ urlContext: {} }];
+    }
 
     const maybeLearned = (): ModelCapability | undefined => {
       if (attemptIdx === 0 && !learnedSystemAsUser) return undefined;
@@ -734,6 +799,7 @@ async function runGeminiModel(options: {
     };
 
     try {
+      const urlCitations = new Set<string>();
       if (streaming) {
         if (resolvedThinking && resolvedThinking.includeThoughts !== false) {
           onThinkingStart?.();
@@ -748,7 +814,9 @@ async function runGeminiModel(options: {
         let fullThought = '';
         for await (const chunk of stream) {
           if (signal.aborted) break;
-          const parts = chunk.candidates?.[0]?.content?.parts || [];
+          const candidate = chunk.candidates?.[0];
+          safelyReadCandidateUrlCitations(candidate, urlCitations);
+          const parts = candidate?.content?.parts || [];
           if (parts.length > 0) {
             for (const part of parts) {
               const rawThought = (part as any).thought;
@@ -774,7 +842,7 @@ async function runGeminiModel(options: {
           appliedSummary: learnedSystemAsUser
             ? `${attempt.summary} (system folded to user)`
             : attempt.summary,
-          retried: attemptIdx > 0 || learnedSystemAsUser,
+          retried: attemptIdx > 0 || learnedSystemAsUser || strippedUrlContextOnRetry,
           retryReason,
           learnedCapability: maybeLearned(),
         };
@@ -786,7 +854,9 @@ async function runGeminiModel(options: {
         });
         let fullText = '';
         let fullThought = '';
-        const parts = resp.candidates?.[0]?.content?.parts || [];
+        const candidate = resp.candidates?.[0];
+        safelyReadCandidateUrlCitations(candidate, urlCitations);
+        const parts = candidate?.content?.parts || [];
         for (const part of parts) {
           const rawThought = (part as any).thought;
           const isThought = rawThought === true || typeof rawThought === 'string';
@@ -803,7 +873,7 @@ async function runGeminiModel(options: {
           appliedSummary: learnedSystemAsUser
             ? `${attempt.summary} (system folded to user)`
             : attempt.summary,
-          retried: attemptIdx > 0 || learnedSystemAsUser,
+          retried: attemptIdx > 0 || learnedSystemAsUser || strippedUrlContextOnRetry,
           retryReason,
           learnedCapability: maybeLearned(),
         };
@@ -814,6 +884,19 @@ async function runGeminiModel(options: {
       const status = Number(err?.status || err?.code || 0);
       const msg = String(err?.message || '');
       const effectiveStatus = status || (msg.includes('400') ? 400 : 0);
+
+      // If urlContext tool was rejected (or final attempt failed parameter check with tools attached), strip tools and retry
+      if (
+        useUrlContext &&
+        isParameterRejection(effectiveStatus, msg) &&
+        (URL_CONTEXT_ERROR_REGEX.test(msg) || attemptIdx === attempts.length - 1)
+      ) {
+        useUrlContext = false;
+        strippedUrlContextOnRetry = true;
+        retryReason = msg.slice(0, 120);
+        attemptIdx--;
+        continue;
+      }
 
       // If systemInstruction itself was rejected, fold systemPrompt into the user message and retry same thinking attempt
       if (
