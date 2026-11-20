@@ -135,7 +135,8 @@ export interface Settings {
 
 export const HISTORY_LIMIT_STEPS = [5, 10, 15, 20, 25, 30, 35, 40] as const;
 
-export const REQUEST_TIMEOUT_MS = 240_000; // 4 minutes
+export const REQUEST_TIMEOUT_MS = 300_000; // 5 minutes (idle / initial)
+export const ACTIVE_STREAM_TIMEOUT_MS = 600_000; // 10 minutes (when actively answering)
 export const MAX_FILE_SIZE_BYTES = 25 * 1024 * 1024; // 25 MB
 
 export const PROVIDERS: ProviderConfig[] = [

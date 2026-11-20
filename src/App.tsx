@@ -29,6 +29,7 @@ import {
   Radio,
 } from 'lucide-react';
 import {
+  ACTIVE_STREAM_TIMEOUT_MS,
   HISTORY_LIMIT_STEPS,
   MAX_FILE_SIZE_BYTES,
   REQUEST_TIMEOUT_MS,
@@ -722,9 +723,30 @@ export default function App() {
     abortControllerRef.current = userController;
     isUserAbortedRef.current = false;
 
+    const timeoutController = new AbortController();
+    const requestStartedAt = Date.now();
+    let timeoutPromoted = false;
+    let timeoutTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
+      timeoutController.abort(
+        new DOMException('Request timed out after 5 minutes.', 'TimeoutError')
+      );
+    }, REQUEST_TIMEOUT_MS);
+
+    const promoteTimeoutToActive = () => {
+      if (timeoutPromoted || timeoutController.signal.aborted) return;
+      timeoutPromoted = true;
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      const remaining = Math.max(1000, ACTIVE_STREAM_TIMEOUT_MS - (Date.now() - requestStartedAt));
+      timeoutTimer = setTimeout(() => {
+        timeoutController.abort(
+          new DOMException('Active response timed out after 10 minutes.', 'TimeoutError')
+        );
+      }, remaining);
+    };
+
     const combinedSignal = AbortSignal.any([
       userController.signal,
-      AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      timeoutController.signal,
     ]);
 
     let accumulatedText = '';
@@ -866,10 +888,12 @@ export default function App() {
           } else if (evt.type === 'thinking') {
             setIsThinkingActive(true);
           } else if (evt.type === 'thought') {
+            promoteTimeoutToActive();
             setIsThinkingActive(true);
             accumulatedThought += evt.text || '';
             setActiveStreamingThought(accumulatedThought);
           } else if (evt.type === 'chunk') {
+            promoteTimeoutToActive();
             setIsThinkingActive(false);
             accumulatedText += evt.text || '';
             setActiveStreamingText(accumulatedText);
@@ -952,6 +976,10 @@ export default function App() {
       setMessages(finalHistory);
       syncSessionMessages(finalHistory, currentChatId);
     } finally {
+      if (timeoutTimer) {
+        clearTimeout(timeoutTimer);
+        timeoutTimer = null;
+      }
       setIsLoading(false);
       setActiveStreamingText('');
       setActiveStreamingThought('');

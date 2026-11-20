@@ -22,7 +22,8 @@ import {
 
 dotenv.config();
 
-const REQUEST_TIMEOUT_MS = 240_000; // 4 minutes
+const REQUEST_TIMEOUT_MS = 300_000; // 5 minutes (initial / non-streaming)
+const ACTIVE_STREAM_TIMEOUT_MS = 600_000; // 10 minutes (raised globally when actively answering)
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024; // 25 MB per file
 const TAVILY_URL = 'https://api.tavily.com/search';
 
@@ -328,7 +329,12 @@ function formatMessagesForOpenAI(
 // Health & Upload Routes
 // ============================================================================
 app.get('/api/health', (_req, res) => {
-  res.json({ status: 'ok', stateless: true, timeoutMs: REQUEST_TIMEOUT_MS });
+  res.json({
+    status: 'ok',
+    stateless: true,
+    timeoutMs: REQUEST_TIMEOUT_MS,
+    activeTimeoutMs: ACTIVE_STREAM_TIMEOUT_MS,
+  });
 });
 
 app.post('/api/upload', upload.array('files', 12), (req, res) => {
@@ -1392,6 +1398,39 @@ async function runOpenAIModel(options: {
   throw lastError || new Error('OpenAI-compatible request failed');
 }
 
+function createAdaptiveTimeout(initialMs: number, activeMs: number, onPromote?: () => void) {
+  const controller = new AbortController();
+  const startedAt = Date.now();
+  let promoted = false;
+  let timer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
+    controller.abort(
+      new DOMException(`Request timed out after ${Math.round(initialMs / 60_000)} minutes.`, 'TimeoutError')
+    );
+  }, initialMs);
+
+  const markActive = () => {
+    if (promoted || controller.signal.aborted) return;
+    promoted = true;
+    if (timer) clearTimeout(timer);
+    const remaining = Math.max(1000, activeMs - (Date.now() - startedAt));
+    timer = setTimeout(() => {
+      controller.abort(
+        new DOMException(`Active response timed out after ${Math.round(activeMs / 60_000)} minutes.`, 'TimeoutError')
+      );
+    }, remaining);
+    onPromote?.();
+  };
+
+  const cleanup = () => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  };
+
+  return { signal: controller.signal, markActive, cleanup };
+}
+
 // ============================================================================
 // Streaming Chat Endpoint
 // ============================================================================
@@ -1404,8 +1443,8 @@ app.post(
     return next();
   },
   async (req, res) => {
-    req.setTimeout(REQUEST_TIMEOUT_MS);
-    res.setTimeout(REQUEST_TIMEOUT_MS);
+    req.setTimeout(ACTIVE_STREAM_TIMEOUT_MS + 5_000);
+    res.setTimeout(ACTIVE_STREAM_TIMEOUT_MS + 5_000);
 
     let parsed: ChatRequestPayload;
     try {
@@ -1462,8 +1501,15 @@ app.post(
       activeRequests.set(requestId, controller);
     }
 
-    const timeoutSignal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
-    const combinedSignal = AbortSignal.any([controller.signal, timeoutSignal]);
+    const adaptiveTimeout = createAdaptiveTimeout(
+      REQUEST_TIMEOUT_MS,
+      ACTIVE_STREAM_TIMEOUT_MS,
+      () => {
+        req.setTimeout(ACTIVE_STREAM_TIMEOUT_MS + 5_000);
+        res.setTimeout(ACTIVE_STREAM_TIMEOUT_MS + 5_000);
+      }
+    );
+    const combinedSignal = AbortSignal.any([controller.signal, adaptiveTimeout.signal]);
 
     const handleDisconnect = () => {
       if (!res.writableEnded) {
@@ -1495,8 +1541,14 @@ app.post(
               capability: modelCap,
               signal: combinedSignal,
               onThinkingStart: () => safeWriteSSE(res, combinedSignal, { type: 'thinking' }),
-              onThought: (text) => safeWriteSSE(res, combinedSignal, { type: 'thought', text }),
-              onChunk: (text) => safeWriteSSE(res, combinedSignal, { type: 'chunk', text }),
+              onThought: (text) => {
+                adaptiveTimeout.markActive();
+                safeWriteSSE(res, combinedSignal, { type: 'thought', text });
+              },
+              onChunk: (text) => {
+                adaptiveTimeout.markActive();
+                safeWriteSSE(res, combinedSignal, { type: 'chunk', text });
+              },
             });
           } else {
             result = await runOpenAIModel({
@@ -1513,15 +1565,23 @@ app.post(
               capability: modelCap,
               signal: combinedSignal,
               onThinkingStart: () => safeWriteSSE(res, combinedSignal, { type: 'thinking' }),
-              onThought: (text) => safeWriteSSE(res, combinedSignal, { type: 'thought', text }),
-              onChunk: (text) => safeWriteSSE(res, combinedSignal, { type: 'chunk', text }),
+              onThought: (text) => {
+                adaptiveTimeout.markActive();
+                safeWriteSSE(res, combinedSignal, { type: 'thought', text });
+              },
+              onChunk: (text) => {
+                adaptiveTimeout.markActive();
+                safeWriteSSE(res, combinedSignal, { type: 'chunk', text });
+              },
             });
 
             if (!streaming) {
               if (result.thought) {
+                adaptiveTimeout.markActive();
                 safeWriteSSE(res, combinedSignal, { type: 'thought', text: result.thought });
               }
               if (result.text) {
+                adaptiveTimeout.markActive();
                 safeWriteSSE(res, combinedSignal, { type: 'chunk', text: result.text });
               }
             }
@@ -1553,6 +1613,13 @@ app.post(
           return;
         } catch (err: any) {
           if (combinedSignal.aborted) {
+            if (adaptiveTimeout.signal.aborted && !controller.signal.aborted && !res.writableEnded && !res.destroyed) {
+              const timeoutMsg =
+                String((adaptiveTimeout.signal.reason as any)?.message || 'Upstream response timed out.');
+              res.write(`data: ${JSON.stringify({ type: 'error', error: timeoutMsg })}\n\n`);
+              res.end();
+              return;
+            }
             break;
           }
 
@@ -1575,6 +1642,7 @@ app.post(
         }
       }
     } finally {
+      adaptiveTimeout.cleanup();
       res.off('close', handleDisconnect);
       if (requestId) activeRequests.delete(requestId);
       if (!res.writableEnded) res.end();
@@ -1734,10 +1802,10 @@ async function startServer() {
     console.log(`Solara stateless server running on http://0.0.0.0:${PORT}`);
   });
 
-  // 4-minute server timeouts
-  server.requestTimeout = 245_000;
-  server.headersTimeout = 245_000;
-  server.keepAliveTimeout = 245_000;
+  // 10-minute active stream server socket ceiling
+  server.requestTimeout = ACTIVE_STREAM_TIMEOUT_MS + 5_000;
+  server.headersTimeout = ACTIVE_STREAM_TIMEOUT_MS + 5_000;
+  server.keepAliveTimeout = ACTIVE_STREAM_TIMEOUT_MS + 5_000;
 }
 
 startServer().catch((err) => {
