@@ -217,11 +217,16 @@ function formatMessagesForGemini(
     if (m.attachments && m.attachments.length > 0) {
       for (const att of m.attachments) {
         if (!att.data) continue;
-        if (isTextMime(att.mimeType, att.name)) {
+        const attMime = (att.mimeType || '').toLowerCase();
+        if (attMime === 'application/zip' || attMime === 'application/x-zip-compressed') {
+          parts.push({
+            text: `\n[Unsupported raw ZIP attachment: ${att.name} (${Math.round((att.size || 0) / 1024)} KB)]\n`,
+          });
+        } else if (isTextMime(att.mimeType, att.name)) {
           try {
             const decoded = Buffer.from(att.data, 'base64').toString('utf8');
             parts.push({
-              text: `\n[Attached File: ${att.name}]\n\`\`\`\n${decoded.slice(0, 400_000)}\n\`\`\`\n`,
+              text: `\n[Attached File: ${att.name}]\n\`\`\`\n${decoded.slice(0, 1_600_000)}\n\`\`\`\n`,
             });
           } catch {
             parts.push({
@@ -302,7 +307,7 @@ function formatMessagesForOpenAI(
         } else if (isTextMime(mime, att.name)) {
           try {
             const decoded = Buffer.from(att.data, 'base64').toString('utf8');
-            textAccum += `\n\n[Attached File: ${att.name}]\n\`\`\`\n${decoded.slice(0, 300_000)}\n\`\`\``;
+            textAccum += `\n\n[Attached File: ${att.name}]\n\`\`\`\n${decoded.slice(0, 1_600_000)}\n\`\`\``;
           } catch {
             textAccum += `\n\n[Attached File: ${att.name}]`;
           }

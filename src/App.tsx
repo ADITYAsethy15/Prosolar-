@@ -81,6 +81,7 @@ import { ChatHistoryDrawer } from './components/ChatHistoryDrawer';
 import { SystemPromptEditor } from './components/SystemPromptEditor';
 import { ConnectionSettingsModal } from './components/TavilySettings';
 import { sanitizeForSpeech, splitIntoSpeechChunks } from './utils/speechSanitizer';
+import { extractZipForChat } from './lib/zipExtract';
 
 const ThoughtSection: React.FC<{ thought: string; isLive?: boolean }> = ({
   thought,
@@ -408,8 +409,8 @@ export default function App() {
     }
   };
 
-  // File processing (up to 25 MB per file)
-  const processFiles = (files: FileList | File[]) => {
+  // File processing (up to 25 MB per file; unpacks .zip archives safely in browser)
+  const processFiles = async (files: FileList | File[]) => {
     const fileArray = Array.from(files);
     for (const file of fileArray) {
       if (file.size > MAX_FILE_SIZE_BYTES) {
@@ -420,6 +421,32 @@ export default function App() {
       const id = `att-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
       const mime =
         file.type || (file.name.toLowerCase().endsWith('.pdf') ? 'application/pdf' : 'text/plain');
+
+      if (
+        file.name.toLowerCase().endsWith('.zip') ||
+        file.type === 'application/zip' ||
+        file.type === 'application/x-zip-compressed'
+      ) {
+        try {
+          setStatusBanner(`Unpacking ${file.name} in browser...`);
+          const extracted = await extractZipForChat(file);
+          setPendingAttachments((prev) => [
+            ...prev,
+            {
+              id,
+              name: `${file.name} (${extracted.extractedCount} files${extracted.truncated ? ', partial' : ''})`,
+              mimeType: 'text/plain',
+              data: extracted.base64Data,
+              size: extracted.byteSize,
+              // Intentionally omit `file` so raw .zip is NEVER uploaded to Cloud Run
+            },
+          ]);
+          setStatusBanner(null);
+        } catch (err: any) {
+          setStatusBanner(err?.message || `Failed to unpack "${file.name}".`);
+        }
+        continue;
+      }
 
       if (mime.startsWith('image/') || file.size <= 4 * 1024 * 1024) {
         const reader = new FileReader();
@@ -791,6 +818,10 @@ export default function App() {
         .map((a) => a.file)
         .filter((f): f is File => Boolean(f));
 
+      const rawFileAttachmentIds = new Set(
+        attachmentsToSend.filter((a) => Boolean(a.file)).map((a) => a.id)
+      );
+
       const payloadObj = {
         requestId,
         providerId: activeProvider,
@@ -805,7 +836,12 @@ export default function App() {
         streaming: uiSettings.streaming,
         messages: outgoingMessages.map((m, idx) =>
           idx === outgoingMessages.length - 1 && rawFiles.length > 0
-            ? { ...m, attachments: undefined } // Files attached via FormData binary fields
+            ? {
+                ...m,
+                attachments: m.attachments?.filter(
+                  (a) => a.id && !rawFileAttachmentIds.has(a.id)
+                ),
+              } // Keep inline-only attachments (e.g. unpacked .zip) while raw Files upload via FormData
             : m
         ),
       };
