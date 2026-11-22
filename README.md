@@ -3,7 +3,7 @@
 Solara is a stateless, full-stack multi-provider AI chat application built with **React 19**, **TypeScript**, **Vite**, **Tailwind CSS v4**, and an **Express** proxy server (`server.ts`). All user-facing state—API keys, custom endpoints, ordered model cascades, learned model capabilities, thinking-level preferences, system prompts, UI theme settings, and your last 10 conversations—is persisted strictly in browser `localStorage`.
 ---
 
-##for hosting just fork the repo or download the zip then upload it to any host like cloudrun or  render 
+## for hosting just fork the repo or download the zip then upload it to any host like cloudrun or  render 
 
 but don't forget to change the password and its cookie 🍪 in server.ts  
 ```
