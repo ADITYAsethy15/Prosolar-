@@ -5,6 +5,7 @@ import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import dotenv from 'dotenv';
 import path from 'path';
 import fs from 'fs';
+import { Agent, fetch as undiciFetch, setGlobalDispatcher } from 'undici';
 import type { Mode, ModelCapability, ProviderId } from './src/types';
 import {
   buildGeminiThinkingAttempts,
@@ -22,10 +23,26 @@ import {
 
 dotenv.config();
 
-const REQUEST_TIMEOUT_MS = 300_000; // 5 minutes (initial / non-streaming)
-const ACTIVE_STREAM_TIMEOUT_MS = 600_000; // 10 minutes (raised globally when actively answering)
+const INITIAL_TIMEOUT_MS = 600_000; // 10 min before first token
+const ACTIVE_TIMEOUT_MS = 1_200_000; // 20 min once streaming starts
+const HANDOFF_LEG_MS =
+  Number(process.env.HANDOFF_LEG_MS) > 0 ? Number(process.env.HANDOFF_LEG_MS) : 250_000; // Hand off 50s before Cloud Run's 300s cap
+const LEG_HARD_CAP_MS =
+  Number(process.env.LEG_HARD_CAP_MS) > 0 ? Number(process.env.LEG_HARD_CAP_MS) : 280_000; // Force-close old leg cleanly before 300s
+const JOB_RETENTION_MS = 60_000; // Retain finished job 60s for late resume replay
+const DISCONNECT_GRACE_MS = 15_000; // 15s grace window for brief network drops
+const REQUEST_TIMEOUT_MS = INITIAL_TIMEOUT_MS;
+const ACTIVE_STREAM_TIMEOUT_MS = ACTIVE_TIMEOUT_MS;
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024; // 25 MB per file
 const TAVILY_URL = 'https://api.tavily.com/search';
+
+const longFetchAgent = new Agent({
+  connectTimeout: 30_000,
+  headersTimeout: ACTIVE_TIMEOUT_MS,
+  bodyTimeout: ACTIVE_TIMEOUT_MS,
+  keepAliveTimeout: 60_000,
+});
+setGlobalDispatcher(longFetchAgent);
 
 const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
@@ -44,6 +61,36 @@ app.use((req, res, next) => {
 
 app.use(express.json({ limit: '30mb' }));
 app.use(express.urlencoded({ limit: '30mb', extended: true }));
+
+// ============================================================================
+// 🔒 SOLARA PASSWORD GATE
+// Visitors without the cookie get a tiny password page; correct password
+// sets a 7-day HttpOnly cookie; /api/* without it gets 401 JSON.
+// Change PW to rotate the password (change KEY too). No client code changes.
+// ============================================================================
+const PW = 'solarauniversa';
+const KEY = 'solara-9f4c2e77ab13'; // random cookie value, moves with PW
+
+app.use((req, res, next) => {
+  if (req.path === '/api/unlock' && req.method === 'POST') {
+    const pw = String((req.body as any || {}).password || '').trim();
+    if (pw === PW) {
+      const forwardedProto = String(req.headers['x-forwarded-proto'] || '').toLowerCase();
+      const isHttps = req.secure || forwardedProto.includes('https');
+      const cookieAttrs = isHttps
+        ? 'Path=/; Max-Age=604800; HttpOnly; SameSite=None; Secure; Partitioned'
+        : 'Path=/; Max-Age=604800; HttpOnly; SameSite=Lax';
+      res.setHeader('Set-Cookie', `solara_key=${KEY}; ${cookieAttrs}`);
+      return res.json({ ok: true });
+    }
+    return res.status(401).json({ ok: false });
+  }
+  if (String(req.headers.cookie || '').includes('solara_key=' + KEY)) return next();
+  if (req.path.startsWith('/api')) return res.status(401).json({ requiresPassword: true });
+  res.status(401).type('html').send(
+    '<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Solara</title><style>body{margin:0;height:100vh;display:grid;place-items:center;background:#09090b;color:#e4e4e7;font-family:system-ui,sans-serif}div{padding:24px;border:1px solid #27272a;border-radius:14px;background:#18181b;width:min(90vw,340px)}input{width:100%;box-sizing:border-box;padding:10px;border-radius:8px;border:1px solid #3f3f46;background:#09090b;color:#fff;font-size:15px}button{margin-top:10px;width:100%;padding:10px;border:0;border-radius:8px;background:#0891b2;color:#fff;font-size:14px;cursor:pointer}p{font-size:12px;color:#71717a}a{color:#22d3ee}</style></head><body><div><b>🔒 This Solara is private</b><p>Enter the access password to continue</p><input id="p" type="password" placeholder="password" autofocus><button type="button" onclick="k()">Enter</button><p id="e"></p></div><script>async function k(){var e=document.getElementById("e"),p=document.getElementById("p");e.textContent="";var r=await fetch("/api/unlock",{method:"POST",credentials:"same-origin",headers:{"content-type":"application/json"},body:JSON.stringify({password:p.value})});if(!r.ok){e.textContent="Wrong password";return}var h=await fetch("/api/health",{credentials:"same-origin",cache:"no-store"});if(h.ok){location.reload()}else{e.innerHTML="Browser blocked cookies in this embedded preview. <a href=\\""+location.href+"\\" target=\\"_blank\\" rel=\\"noopener noreferrer\\">Open Solara in a new tab</a> to unlock."}}document.getElementById("p").onkeydown=function(x){if(x.key==="Enter")k()}</script></body></html>'
+  );
+});
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -129,12 +176,6 @@ function isTextMime(mime: string, name: string): boolean {
   return /\.(txt|md|markdown|csv|tsv|json|log|py|js|ts|tsx|jsx|html|css|yml|yaml|xml|sql|sh|c|cpp|h|java|rs|go)$/i.test(
     n
   );
-}
-
-function safeWriteSSE(res: express.Response, signal: AbortSignal, payload: unknown): void {
-  if (!signal.aborted && !res.writableEnded && !res.destroyed) {
-    res.write(`data: ${JSON.stringify(payload)}\n\n`);
-  }
 }
 
 function extractErrorMessage(raw: string, status: number): string {
@@ -331,14 +372,14 @@ function formatMessagesForOpenAI(
 }
 
 // ============================================================================
-// Health & Upload Routes
+// Health, Upload & Stream Resume / Abort Routes
 // ============================================================================
 app.get('/api/health', (_req, res) => {
   res.json({
     status: 'ok',
     stateless: true,
-    timeoutMs: REQUEST_TIMEOUT_MS,
-    activeTimeoutMs: ACTIVE_STREAM_TIMEOUT_MS,
+    timeoutMs: INITIAL_TIMEOUT_MS,
+    activeTimeoutMs: ACTIVE_TIMEOUT_MS,
   });
 });
 
@@ -353,18 +394,266 @@ app.post('/api/upload', upload.array('files', 12), (req, res) => {
   res.json({ files });
 });
 
+interface StoredSseEvent {
+  seq: number;
+  payload: Record<string, unknown>;
+}
+
+interface StreamJob {
+  jobId: string;
+  controller: AbortController;
+  events: StoredSseEvent[];
+  nextSeq: number;
+  lastSeq: number;
+  lastSentSeq: number;
+  writer: express.Response | null;
+  finished: boolean;
+  aborted: boolean;
+  startedAt: number;
+  promotedToActive: boolean;
+  keepaliveTimer: ReturnType<typeof setInterval> | null;
+  legTimer: ReturnType<typeof setTimeout> | null;
+  hardCloseTimer: ReturnType<typeof setTimeout> | null;
+  disconnectTimer: ReturnType<typeof setTimeout> | null;
+  jobTimeoutTimer: ReturnType<typeof setTimeout> | null;
+  cleanupTimer: ReturnType<typeof setTimeout> | null;
+}
+
+const activeJobs = new Map<string, StreamJob>();
+
+function clearWriterTimers(job: StreamJob): void {
+  if (job.keepaliveTimer) {
+    clearInterval(job.keepaliveTimer);
+    job.keepaliveTimer = null;
+  }
+  if (job.legTimer) {
+    clearTimeout(job.legTimer);
+    job.legTimer = null;
+  }
+  if (job.hardCloseTimer) {
+    clearTimeout(job.hardCloseTimer);
+    job.hardCloseTimer = null;
+  }
+}
+
+function emitJobEvent(job: StreamJob, payload: Record<string, unknown>): void {
+  const seq = job.nextSeq++;
+  job.lastSeq = seq;
+  const eventPayload = { ...payload, _seq: seq };
+  job.events.push({ seq, payload: eventPayload });
+  if (job.writer && !job.writer.writableEnded && !job.writer.destroyed) {
+    job.writer.write(`data: ${JSON.stringify(eventPayload)}\n\n`);
+    job.lastSentSeq = seq;
+  }
+}
+
+function finishJob(job: StreamJob): void {
+  if (job.finished) return;
+  job.finished = true;
+  if (job.jobTimeoutTimer) {
+    clearTimeout(job.jobTimeoutTimer);
+    job.jobTimeoutTimer = null;
+  }
+  if (job.disconnectTimer) {
+    clearTimeout(job.disconnectTimer);
+    job.disconnectTimer = null;
+  }
+  clearWriterTimers(job);
+  if (job.writer && !job.writer.writableEnded && !job.writer.destroyed) {
+    job.writer.end();
+  }
+  job.writer = null;
+  if (job.cleanupTimer) clearTimeout(job.cleanupTimer);
+  job.cleanupTimer = setTimeout(() => {
+    if (activeJobs.get(job.jobId) === job) {
+      activeJobs.delete(job.jobId);
+    }
+  }, JOB_RETENTION_MS);
+}
+
+function failJobOnTimeout(job: StreamJob, message: string): void {
+  if (job.finished) return;
+  emitJobEvent(job, { type: 'error', error: message });
+  finishJob(job);
+  job.controller.abort(new DOMException(message, 'TimeoutError'));
+}
+
+function promoteJobTimeout(job: StreamJob): void {
+  if (job.promotedToActive || job.finished || job.controller.signal.aborted) return;
+  job.promotedToActive = true;
+  if (job.jobTimeoutTimer) {
+    clearTimeout(job.jobTimeoutTimer);
+    job.jobTimeoutTimer = null;
+  }
+  const remaining = Math.max(1000, ACTIVE_TIMEOUT_MS - (Date.now() - job.startedAt));
+  job.jobTimeoutTimer = setTimeout(() => {
+    failJobOnTimeout(job, 'Upstream model timed out after 20 minutes.');
+  }, remaining);
+}
+
+function attachWriter(
+  job: StreamJob,
+  req: express.Request,
+  res: express.Response,
+  skipHeaders = false
+): void {
+  if (!skipHeaders) {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders?.();
+  }
+
+  req.setTimeout(LEG_HARD_CAP_MS + 15_000);
+  res.setTimeout(LEG_HARD_CAP_MS + 15_000);
+
+  if (job.disconnectTimer) {
+    clearTimeout(job.disconnectTimer);
+    job.disconnectTimer = null;
+  }
+  clearWriterTimers(job);
+  job.writer = res;
+
+  job.keepaliveTimer = setInterval(() => {
+    if (job.writer === res && !res.writableEnded && !res.destroyed) {
+      res.write(': keepalive\n\n');
+    }
+  }, 15_000);
+
+  job.legTimer = setTimeout(() => {
+    if (!job.finished && job.writer === res && !res.writableEnded && !res.destroyed) {
+      res.write(
+        `data: ${JSON.stringify({
+          type: 'handoff',
+          jobId: job.jobId,
+          afterSeq: job.lastSeq,
+        })}\n\n`
+      );
+    }
+  }, HANDOFF_LEG_MS);
+
+  job.hardCloseTimer = setTimeout(() => {
+    if (job.writer === res && !res.writableEnded && !res.destroyed) {
+      (res as any).__handedOff = true;
+      clearWriterTimers(job);
+      job.writer = null;
+      res.end();
+      if (!job.finished && !job.disconnectTimer) {
+        job.disconnectTimer = setTimeout(() => {
+          job.disconnectTimer = null;
+          if (!job.finished && !job.writer) {
+            job.aborted = true;
+            job.controller.abort(new Error('Client failed to resume after handoff'));
+            finishJob(job);
+          }
+        }, DISCONNECT_GRACE_MS);
+      }
+    }
+  }, LEG_HARD_CAP_MS);
+
+  res.on('close', () => {
+    if (job.writer === res) {
+      clearWriterTimers(job);
+      job.writer = null;
+    }
+    if ((res as any).__handedOff || job.finished || job.aborted || job.writer !== null) {
+      return;
+    }
+    if (!job.disconnectTimer) {
+      job.disconnectTimer = setTimeout(() => {
+        job.disconnectTimer = null;
+        if (!job.finished && !job.writer) {
+          job.aborted = true;
+          job.controller.abort(new Error('Client disconnected'));
+          finishJob(job);
+        }
+      }, DISCONNECT_GRACE_MS);
+    }
+  });
+}
+
 // ============================================================================
-// True Stream Abort Endpoint
+// Seamless Overlap SSE Resume Endpoint
+// ============================================================================
+app.get('/api/chat/resume', (req, res) => {
+  const jobId = typeof req.query.jobId === 'string' ? req.query.jobId.trim() : '';
+  const afterSeq = Math.max(0, Number(req.query.afterSeq || 0) || 0);
+  const job = jobId ? activeJobs.get(jobId) : undefined;
+
+  if (!job) {
+    return res.status(404).json({ error: 'Stream session expired.' });
+  }
+
+  // Immediately flush SSE headers + keepalive comment byte so reverse proxies commit the stream
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders?.();
+  if (!res.writableEnded && !res.destroyed) {
+    res.write(': resume-ok\n\n');
+  }
+
+  // Replay any missed events before attaching the live writer
+  let maxReplayedSeq = job.lastSentSeq;
+  for (const ev of job.events) {
+    if (ev.seq > afterSeq && !res.writableEnded && !res.destroyed) {
+      res.write(`data: ${JSON.stringify(ev.payload)}\n\n`);
+      if (ev.seq > maxReplayedSeq) {
+        maxReplayedSeq = ev.seq;
+      }
+    }
+  }
+  job.lastSentSeq = Math.max(job.lastSentSeq, maxReplayedSeq);
+
+  const prevWriter = job.writer;
+  if (prevWriter && prevWriter !== res) {
+    (prevWriter as any).__handedOff = true;
+    clearWriterTimers(job);
+  }
+
+  if (job.finished) {
+    if (prevWriter && prevWriter !== res && !prevWriter.writableEnded && !prevWriter.destroyed) {
+      prevWriter.end();
+    }
+    if (!res.writableEnded && !res.destroyed) {
+      res.end();
+    }
+    return;
+  }
+
+  // Swap writer to new connection BEFORE closing previous leg (0ms gap)
+  attachWriter(job, req, res, true);
+
+  if (prevWriter && prevWriter !== res && !prevWriter.writableEnded && !prevWriter.destroyed) {
+    prevWriter.end();
+  }
+});
+
+// ============================================================================
+// Instant True Stream Abort Endpoint (0ms delay)
 // ============================================================================
 app.post('/api/chat/abort', (req, res) => {
   const requestId = typeof req.body?.requestId === 'string' ? req.body.requestId.trim() : '';
+  let aborted = false;
+
+  if (requestId && activeJobs.has(requestId)) {
+    const job = activeJobs.get(requestId)!;
+    job.aborted = true;
+    aborted = true;
+    job.controller.abort(new Error('User aborted request'));
+    finishJob(job);
+  }
+
   if (requestId && activeRequests.has(requestId)) {
     const ctrl = activeRequests.get(requestId)!;
     ctrl.abort(new Error('User aborted request'));
     activeRequests.delete(requestId);
-    return res.json({ aborted: true, requestId });
+    aborted = true;
   }
-  return res.json({ aborted: false, requestId });
+
+  return res.json({ aborted, requestId });
 });
 
 // ============================================================================
@@ -757,6 +1046,7 @@ async function runGeminiModel(options: {
     apiKey,
     httpOptions: {
       apiVersion: 'v1beta',
+      timeout: ACTIVE_TIMEOUT_MS,
       headers: { 'User-Agent': 'aistudio-build' },
     },
   });
@@ -1229,11 +1519,12 @@ async function runOpenAIModel(options: {
       idx > 0
     );
 
-    const upstream = await fetch(url, {
+    const upstream = await undiciFetch(url, {
       method: 'POST',
       headers,
       body: JSON.stringify(attempt.payload),
-      signal,
+      signal: signal as any,
+      dispatcher: longFetchAgent,
     });
 
     if (!upstream.ok) {
@@ -1251,7 +1542,7 @@ async function runOpenAIModel(options: {
     }
 
     if (!streaming || !upstream.body) {
-      const json = await upstream.json();
+      const json = (await upstream.json()) as any;
       const choice = json?.choices?.[0];
       const msgObj = choice?.message || {};
       const content =
@@ -1403,42 +1694,160 @@ async function runOpenAIModel(options: {
   throw lastError || new Error('OpenAI-compatible request failed');
 }
 
-function createAdaptiveTimeout(initialMs: number, activeMs: number, onPromote?: () => void) {
-  const controller = new AbortController();
-  const startedAt = Date.now();
-  let promoted = false;
-  let timer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
-    controller.abort(
-      new DOMException(`Request timed out after ${Math.round(initialMs / 60_000)} minutes.`, 'TimeoutError')
-    );
-  }, initialMs);
+// ============================================================================
+// Streaming Chat Endpoint (Decoupled StreamJob + Overlap SSE Handoff)
+// ============================================================================
+async function executeStreamJob(
+  job: StreamJob,
+  params: {
+    providerId: ProviderId;
+    baseUrl: string;
+    apiKey: string;
+    cascade: string[];
+    messages: MessageInput[];
+    systemPrompt: string;
+    thinkingLevel: Mode;
+    historyLimit: number;
+    maxTokens: number;
+    streaming: boolean;
+    capabilities?: Record<string, ModelCapability>;
+  }
+): Promise<void> {
+  const {
+    providerId,
+    baseUrl,
+    apiKey,
+    cascade,
+    messages,
+    systemPrompt,
+    thinkingLevel,
+    historyLimit,
+    maxTokens,
+    streaming,
+    capabilities,
+  } = params;
 
-  const markActive = () => {
-    if (promoted || controller.signal.aborted) return;
-    promoted = true;
-    if (timer) clearTimeout(timer);
-    const remaining = Math.max(1000, activeMs - (Date.now() - startedAt));
-    timer = setTimeout(() => {
-      controller.abort(
-        new DOMException(`Active response timed out after ${Math.round(activeMs / 60_000)} minutes.`, 'TimeoutError')
-      );
-    }, remaining);
-    onPromote?.();
-  };
+  try {
+    for (let i = 0; i < cascade.length; i++) {
+      if (job.controller.signal.aborted || job.finished) break;
+      const targetModel = cascade[i];
+      const modelCap = capabilities?.[targetModel];
+      emitJobEvent(job, { type: 'model_init', model: targetModel });
 
-  const cleanup = () => {
-    if (timer) {
-      clearTimeout(timer);
-      timer = null;
+      try {
+        let result: ModelExecutionResult;
+        if (providerId === 'gemini') {
+          result = await runGeminiWithFallback({
+            baseUrl,
+            model: targetModel,
+            apiKey,
+            messages,
+            systemPrompt,
+            thinkingLevel,
+            historyLimit,
+            maxTokens,
+            streaming,
+            capability: modelCap,
+            signal: job.controller.signal,
+            onThinkingStart: () => emitJobEvent(job, { type: 'thinking' }),
+            onThought: (text) => {
+              promoteJobTimeout(job);
+              emitJobEvent(job, { type: 'thought', text });
+            },
+            onChunk: (text) => {
+              promoteJobTimeout(job);
+              emitJobEvent(job, { type: 'chunk', text });
+            },
+          });
+        } else {
+          result = await runOpenAIModel({
+            providerId,
+            baseUrl,
+            apiKey,
+            model: targetModel,
+            messages,
+            systemPrompt,
+            thinkingLevel,
+            historyLimit,
+            maxTokens,
+            streaming,
+            capability: modelCap,
+            signal: job.controller.signal,
+            onThinkingStart: () => emitJobEvent(job, { type: 'thinking' }),
+            onThought: (text) => {
+              promoteJobTimeout(job);
+              emitJobEvent(job, { type: 'thought', text });
+            },
+            onChunk: (text) => {
+              promoteJobTimeout(job);
+              emitJobEvent(job, { type: 'chunk', text });
+            },
+          });
+        }
+
+        if (!streaming) {
+          if (result.thought) {
+            promoteJobTimeout(job);
+            emitJobEvent(job, { type: 'thought', text: result.thought });
+          }
+          if (result.text) {
+            promoteJobTimeout(job);
+            emitJobEvent(job, { type: 'chunk', text: result.text });
+          }
+        }
+
+        if (job.controller.signal.aborted || job.finished) break;
+
+        if (!result.text.trim() && !result.thought.trim()) {
+          throw new Error('Model returned an empty response');
+        }
+
+        if (result.learnedCapability) {
+          emitJobEvent(job, {
+            type: 'learned_capability',
+            model: targetModel,
+            capability: result.learnedCapability,
+          });
+        }
+        emitJobEvent(job, {
+          type: 'model_meta',
+          model: targetModel,
+          requestedMode: thinkingLevel,
+          appliedSummary: result.appliedSummary,
+          retried: result.retried,
+          retryReason: result.retryReason,
+        });
+        emitJobEvent(job, { type: 'done', modelUsed: targetModel });
+        finishJob(job);
+        return;
+      } catch (err: any) {
+        if (job.controller.signal.aborted || job.finished) {
+          break;
+        }
+
+        const reason = String(err?.message || 'Upstream error').slice(0, 140);
+        if (i < cascade.length - 1) {
+          emitJobEvent(job, {
+            type: 'fallback_notice',
+            failedModel: targetModel,
+            nextModel: cascade[i + 1],
+            reason,
+          });
+        } else {
+          emitJobEvent(job, {
+            type: 'error',
+            error: `All ${cascade.length} model(s) in cascade failed. Last error (${targetModel}): ${reason}`,
+          });
+          finishJob(job);
+          return;
+        }
+      }
     }
-  };
-
-  return { signal: controller.signal, markActive, cleanup };
+  } finally {
+    finishJob(job);
+  }
 }
 
-// ============================================================================
-// Streaming Chat Endpoint
-// ============================================================================
 app.post(
   '/api/chat/stream',
   (req, res, next) => {
@@ -1448,9 +1857,6 @@ app.post(
     return next();
   },
   async (req, res) => {
-    req.setTimeout(ACTIVE_STREAM_TIMEOUT_MS + 5_000);
-    res.setTimeout(ACTIVE_STREAM_TIMEOUT_MS + 5_000);
-
     let parsed: ChatRequestPayload;
     try {
       parsed = parseChatPayload(req);
@@ -1495,163 +1901,61 @@ app.post(
       return res.status(401).json({ error: `Missing API key for ${providerId}. Add it in Connection Settings.` });
     }
 
-    // Set SSE Headers
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.flushHeaders?.();
+    const jobId =
+      (requestId || '').trim() || `job-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-    const controller = new AbortController();
-    if (requestId) {
-      activeRequests.set(requestId, controller);
+    const priorJob = activeJobs.get(jobId);
+    if (priorJob) {
+      priorJob.aborted = true;
+      priorJob.controller.abort(new Error('Replaced by new request'));
+      finishJob(priorJob);
+      if (priorJob.cleanupTimer) {
+        clearTimeout(priorJob.cleanupTimer);
+        priorJob.cleanupTimer = null;
+      }
+      activeJobs.delete(jobId);
     }
 
-    const adaptiveTimeout = createAdaptiveTimeout(
-      REQUEST_TIMEOUT_MS,
-      ACTIVE_STREAM_TIMEOUT_MS,
-      () => {
-        req.setTimeout(ACTIVE_STREAM_TIMEOUT_MS + 5_000);
-        res.setTimeout(ACTIVE_STREAM_TIMEOUT_MS + 5_000);
-      }
-    );
-    const combinedSignal = AbortSignal.any([controller.signal, adaptiveTimeout.signal]);
-
-    const handleDisconnect = () => {
-      if (!res.writableEnded) {
-        controller.abort(new Error('Client disconnected'));
-      }
+    const job: StreamJob = {
+      jobId,
+      controller: new AbortController(),
+      events: [],
+      nextSeq: 1,
+      lastSeq: 0,
+      lastSentSeq: 0,
+      writer: null,
+      finished: false,
+      aborted: false,
+      startedAt: Date.now(),
+      promotedToActive: false,
+      keepaliveTimer: null,
+      legTimer: null,
+      hardCloseTimer: null,
+      disconnectTimer: null,
+      jobTimeoutTimer: null,
+      cleanupTimer: null,
     };
-    res.on('close', handleDisconnect);
 
-    try {
-      for (let i = 0; i < cascade.length; i++) {
-        if (combinedSignal.aborted) break;
-        const targetModel = cascade[i];
-        const modelCap = capabilities?.[targetModel];
-        safeWriteSSE(res, combinedSignal, { type: 'model_init', model: targetModel });
+    job.jobTimeoutTimer = setTimeout(() => {
+      failJobOnTimeout(job, 'Upstream model timed out after 10 minutes without responding.');
+    }, INITIAL_TIMEOUT_MS);
 
-        try {
-          let result: ModelExecutionResult;
-          if (providerId === 'gemini') {
-            result = await runGeminiWithFallback({
-              baseUrl,
-              model: targetModel,
-              apiKey,
-              messages,
-              systemPrompt,
-              thinkingLevel,
-              historyLimit,
-              maxTokens,
-              streaming,
-              capability: modelCap,
-              signal: combinedSignal,
-              onThinkingStart: () => safeWriteSSE(res, combinedSignal, { type: 'thinking' }),
-              onThought: (text) => {
-                adaptiveTimeout.markActive();
-                safeWriteSSE(res, combinedSignal, { type: 'thought', text });
-              },
-              onChunk: (text) => {
-                adaptiveTimeout.markActive();
-                safeWriteSSE(res, combinedSignal, { type: 'chunk', text });
-              },
-            });
-          } else {
-            result = await runOpenAIModel({
-              providerId,
-              baseUrl,
-              apiKey,
-              model: targetModel,
-              messages,
-              systemPrompt,
-              thinkingLevel,
-              historyLimit,
-              maxTokens,
-              streaming,
-              capability: modelCap,
-              signal: combinedSignal,
-              onThinkingStart: () => safeWriteSSE(res, combinedSignal, { type: 'thinking' }),
-              onThought: (text) => {
-                adaptiveTimeout.markActive();
-                safeWriteSSE(res, combinedSignal, { type: 'thought', text });
-              },
-              onChunk: (text) => {
-                adaptiveTimeout.markActive();
-                safeWriteSSE(res, combinedSignal, { type: 'chunk', text });
-              },
-            });
+    activeJobs.set(jobId, job);
+    attachWriter(job, req, res);
 
-            if (!streaming) {
-              if (result.thought) {
-                adaptiveTimeout.markActive();
-                safeWriteSSE(res, combinedSignal, { type: 'thought', text: result.thought });
-              }
-              if (result.text) {
-                adaptiveTimeout.markActive();
-                safeWriteSSE(res, combinedSignal, { type: 'chunk', text: result.text });
-              }
-            }
-          }
-
-          if (combinedSignal.aborted) break;
-
-          if (!result.text.trim() && !result.thought.trim()) {
-            throw new Error('Model returned an empty response');
-          }
-
-          if (result.learnedCapability) {
-            safeWriteSSE(res, combinedSignal, {
-              type: 'learned_capability',
-              model: targetModel,
-              capability: result.learnedCapability,
-            });
-          }
-          safeWriteSSE(res, combinedSignal, {
-            type: 'model_meta',
-            model: targetModel,
-            requestedMode: thinkingLevel,
-            appliedSummary: result.appliedSummary,
-            retried: result.retried,
-            retryReason: result.retryReason,
-          });
-          safeWriteSSE(res, combinedSignal, { type: 'done', modelUsed: targetModel });
-          if (!res.writableEnded) res.end();
-          return;
-        } catch (err: any) {
-          if (combinedSignal.aborted) {
-            if (adaptiveTimeout.signal.aborted && !controller.signal.aborted && !res.writableEnded && !res.destroyed) {
-              const timeoutMsg =
-                String((adaptiveTimeout.signal.reason as any)?.message || 'Upstream response timed out.');
-              res.write(`data: ${JSON.stringify({ type: 'error', error: timeoutMsg })}\n\n`);
-              res.end();
-              return;
-            }
-            break;
-          }
-
-          const reason = String(err?.message || 'Upstream error').slice(0, 140);
-          if (i < cascade.length - 1) {
-            safeWriteSSE(res, combinedSignal, {
-              type: 'fallback_notice',
-              failedModel: targetModel,
-              nextModel: cascade[i + 1],
-              reason,
-            });
-          } else {
-            safeWriteSSE(res, combinedSignal, {
-              type: 'error',
-              error: `All ${cascade.length} model(s) in cascade failed. Last error (${targetModel}): ${reason}`,
-            });
-            if (!res.writableEnded) res.end();
-            return;
-          }
-        }
-      }
-    } finally {
-      adaptiveTimeout.cleanup();
-      res.off('close', handleDisconnect);
-      if (requestId) activeRequests.delete(requestId);
-      if (!res.writableEnded) res.end();
-    }
+    void executeStreamJob(job, {
+      providerId,
+      baseUrl,
+      apiKey,
+      cascade,
+      messages,
+      systemPrompt,
+      thinkingLevel,
+      historyLimit,
+      maxTokens,
+      streaming,
+      capabilities,
+    });
   }
 );
 
@@ -1807,10 +2111,10 @@ async function startServer() {
     console.log(`Solara stateless server running on http://0.0.0.0:${PORT}`);
   });
 
-  // 10-minute active stream server socket ceiling
+  // 20-minute active stream server socket ceiling
   server.requestTimeout = ACTIVE_STREAM_TIMEOUT_MS + 5_000;
   server.headersTimeout = ACTIVE_STREAM_TIMEOUT_MS + 5_000;
-  server.keepAliveTimeout = ACTIVE_STREAM_TIMEOUT_MS + 5_000;
+  server.keepAliveTimeout = 65_000;
 }
 
 startServer().catch((err) => {

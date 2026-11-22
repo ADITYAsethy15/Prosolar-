@@ -74,7 +74,8 @@ export const CascadeEditor: React.FC<CascadeEditorProps> = ({
   const [catalogCache, setCatalogCache] = useState<Partial<Record<ProviderId, CatalogCacheEntry>>>({});
   const [fetchingProvider, setFetchingProvider] = useState<ProviderId | null>(null);
   const [isCatalogExpanded, setIsCatalogExpanded] = useState(true);
-  const importInputRef = useRef<HTMLInputElement>(null);
+  const providerImportInputRef = useRef<HTMLInputElement>(null);
+  const importAllInputRef = useRef<HTMLInputElement>(null);
 
   // Sync tab when modal opens
   React.useEffect(() => {
@@ -198,34 +199,151 @@ export const CascadeEditor: React.FC<CascadeEditorProps> = ({
     });
   };
 
-  const handleExport = () => {
+  const cleanModelList = (rawList: unknown[], targetId: ProviderId): string[] => {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const item of rawList) {
+      if (typeof item !== 'string') continue;
+      const cleaned =
+        targetId === 'gemini' ? item.trim().replace(/^models\//i, '') : item.trim();
+      if (!cleaned || seen.has(cleaned)) continue;
+      seen.add(cleaned);
+      out.push(cleaned);
+    }
+    return out;
+  };
+
+  const triggerJsonDownload = (payload: unknown, filename: string) => {
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const handleExportProvider = () => {
+    try {
+      const slug = meta.shortLabel
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '');
+      const payload = {
+        version: 3,
+        scope: 'provider',
+        providerId: selectedTab,
+        providerLabel: meta.label,
+        ...(meta.baseUrl ? { baseUrl: meta.baseUrl } : {}),
+        models: currentCascade,
+        exportedAt: new Date().toISOString(),
+      };
+      const dateStr = new Date().toISOString().slice(0, 10);
+      const namePart = slug && slug !== selectedTab ? `${selectedTab}-${slug}` : selectedTab;
+      triggerJsonDownload(payload, `solara-${namePart}-cascade-${dateStr}.json`);
+      setNotice(`Exported ${currentCascade.length} model(s) from ${meta.shortLabel}.`);
+    } catch {
+      setNotice(`Failed to export ${meta.shortLabel} cascade.`);
+    }
+  };
+
+  const handleExportAll = () => {
     try {
       const payload = {
         version: 2,
         cascades,
         exportedAt: new Date().toISOString(),
       };
-      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `solara-cascades-${new Date().toISOString().slice(0, 10)}.json`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
+      triggerJsonDownload(payload, `solara-cascades-${new Date().toISOString().slice(0, 10)}.json`);
       setNotice('Exported all provider cascades as JSON.');
     } catch {
-      setNotice('Failed to export cascade configuration.');
+      setNotice('Failed to export all cascades.');
     }
   };
 
-  const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleImportProvider = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     e.target.value = '';
     if (!file) return;
     try {
       const parsed = JSON.parse(await file.text());
+      let rawModels: unknown[] | null = null;
+
+      if (Array.isArray(parsed)) {
+        // Bare string[] array of model IDs
+        rawModels = parsed;
+      } else if (parsed && typeof parsed === 'object') {
+        if (Array.isArray(parsed.models)) {
+          // Version 3 single-provider export ({ version: 3, providerId, models: [...] })
+          rawModels = parsed.models;
+        } else {
+          const source =
+            parsed.cascades && typeof parsed.cascades === 'object' ? parsed.cascades : parsed;
+          if (source && typeof source === 'object' && !Array.isArray(source)) {
+            const tabArr = Array.isArray(source[selectedTab]) ? source[selectedTab] : null;
+            const nonEmptyTabs = PROVIDERS.filter(
+              (p) => Array.isArray(source[p.id]) && source[p.id].length > 0
+            );
+
+            if (tabArr && tabArr.length > 0) {
+              rawModels = tabArr;
+            } else if (nonEmptyTabs.length === 1) {
+              // e.g. importing a single-populated-provider v2 backup into custom1 or custom2
+              rawModels = source[nonEmptyTabs[0].id];
+            } else if (tabArr) {
+              rawModels = tabArr;
+            } else if (nonEmptyTabs.length > 1) {
+              setNotice(
+                `This file has cascades for ${nonEmptyTabs.length} providers. Select a matching tab or use "Import All".`
+              );
+              return;
+            }
+          }
+        }
+      }
+
+      if (!rawModels) {
+        setNotice(`Invalid JSON: expected a model array or ${meta.shortLabel} cascade export.`);
+        return;
+      }
+
+      const cleaned = cleanModelList(rawModels, selectedTab);
+      onUpdateCascades({
+        ...cascades,
+        [selectedTab]: cleaned,
+      });
+      setNotice(`Loaded ${cleaned.length} model(s) into ${meta.shortLabel}.`);
+    } catch {
+      setNotice('Invalid JSON file.');
+    }
+  };
+
+  const handleImportAll = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    try {
+      const parsed = JSON.parse(await file.text());
+      if (
+        parsed &&
+        typeof parsed === 'object' &&
+        !Array.isArray(parsed) &&
+        Array.isArray(parsed.models) &&
+        typeof parsed.providerId === 'string' &&
+        PROVIDERS.some((p) => p.id === parsed.providerId)
+      ) {
+        const targetId = parsed.providerId as ProviderId;
+        const cleaned = cleanModelList(parsed.models, targetId);
+        onUpdateCascades({
+          ...cascades,
+          [targetId]: cleaned,
+        });
+        setNotice(`Imported ${cleaned.length} model(s) into ${targetId}.`);
+        return;
+      }
+
       const source = parsed?.cascades && typeof parsed.cascades === 'object' ? parsed.cascades : parsed;
       if (!source || typeof source !== 'object' || Array.isArray(source)) {
         setNotice('Invalid JSON: expected a cascades object.');
@@ -235,9 +353,7 @@ export const CascadeEditor: React.FC<CascadeEditorProps> = ({
       let importedCount = 0;
       for (const p of PROVIDERS) {
         if (Array.isArray(source[p.id])) {
-          next[p.id] = source[p.id].filter(
-            (x: unknown): x is string => typeof x === 'string' && x.trim().length > 0
-          );
+          next[p.id] = cleanModelList(source[p.id], p.id);
           importedCount++;
         }
       }
@@ -575,27 +691,54 @@ export const CascadeEditor: React.FC<CascadeEditorProps> = ({
             )}
             <button
               type="button"
-              onClick={handleExport}
+              onClick={handleExportProvider}
               className="px-2.5 sm:px-3 py-1.5 rounded-lg bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 text-[11px] sm:text-xs font-medium text-zinc-200 transition-colors cursor-pointer flex items-center gap-1.5"
+              title={`Export only ${meta.shortLabel}'s cascade as JSON`}
             >
               <Download className="w-3.5 h-3.5 text-cyan-400" />
-              <span>Export JSON</span>
+              <span>Export {meta.shortLabel}</span>
             </button>
             <input
-              ref={importInputRef}
+              ref={providerImportInputRef}
               type="file"
               accept=".json,application/json"
-              onChange={handleImport}
+              onChange={handleImportProvider}
               className="hidden"
             />
             <button
               type="button"
-              onClick={() => importInputRef.current?.click()}
+              onClick={() => providerImportInputRef.current?.click()}
               className="px-2.5 sm:px-3 py-1.5 rounded-lg bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 text-[11px] sm:text-xs font-medium text-zinc-200 transition-colors cursor-pointer flex items-center gap-1.5"
+              title={`Load a saved provider cascade JSON directly into ${meta.shortLabel} without affecting other providers`}
             >
               <Upload className="w-3.5 h-3.5 text-emerald-400" />
-              <span>Import JSON</span>
+              <span>Import → {meta.shortLabel}</span>
             </button>
+            <input
+              ref={importAllInputRef}
+              type="file"
+              accept=".json,application/json"
+              onChange={handleImportAll}
+              className="hidden"
+            />
+            <div className="flex items-center gap-1 pl-1 border-l border-zinc-800/80">
+              <button
+                type="button"
+                onClick={handleExportAll}
+                className="px-2 py-1.5 rounded-lg bg-zinc-950 hover:bg-zinc-800 border border-zinc-800 text-[10px] sm:text-[11px] font-medium text-zinc-400 hover:text-zinc-200 transition-colors cursor-pointer"
+                title="Export full backup of all 7 provider cascades"
+              >
+                Export All
+              </button>
+              <button
+                type="button"
+                onClick={() => importAllInputRef.current?.click()}
+                className="px-2 py-1.5 rounded-lg bg-zinc-950 hover:bg-zinc-800 border border-zinc-800 text-[10px] sm:text-[11px] font-medium text-zinc-400 hover:text-zinc-200 transition-colors cursor-pointer"
+                title="Restore full multi-provider cascades backup JSON"
+              >
+                Import All
+              </button>
+            </div>
           </div>
           <button
             type="button"

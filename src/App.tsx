@@ -755,7 +755,7 @@ export default function App() {
     let timeoutPromoted = false;
     let timeoutTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
       timeoutController.abort(
-        new DOMException('Request timed out after 5 minutes.', 'TimeoutError')
+        new DOMException('Request timed out after 10 minutes.', 'TimeoutError')
       );
     }, REQUEST_TIMEOUT_MS);
 
@@ -766,7 +766,7 @@ export default function App() {
       const remaining = Math.max(1000, ACTIVE_STREAM_TIMEOUT_MS - (Date.now() - requestStartedAt));
       timeoutTimer = setTimeout(() => {
         timeoutController.abort(
-          new DOMException('Active response timed out after 10 minutes.', 'TimeoutError')
+          new DOMException('Active response timed out after 20 minutes.', 'TimeoutError')
         );
       }, remaining);
     };
@@ -876,83 +876,286 @@ export default function App() {
         throw new Error('No response stream returned from server.');
       }
 
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let sseBuffer = '';
+      let lastProcessedSeq = 0;
+      const activeJobId = requestId;
+      let terminalEventSeen = false;
+      let currentResponse: Response | null = response;
+      let reconnectAttempts = 0;
+      let thinkingUiActive = false;
+      const RECONNECT_BACKOFFS = [400, 1000, 2000, 3000];
 
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
+      let uiFlushTimer: ReturnType<typeof setTimeout> | null = null;
+      let dirtyThought = false;
+      let dirtyText = false;
 
-        sseBuffer += decoder.decode(value, { stream: true });
-        const lines = sseBuffer.split('\n');
-        sseBuffer = lines.pop() || '';
+      const flushStreamingUi = () => {
+        if (uiFlushTimer) {
+          clearTimeout(uiFlushTimer);
+          uiFlushTimer = null;
+        }
+        if (dirtyThought) {
+          dirtyThought = false;
+          setActiveStreamingThought(accumulatedThought);
+        }
+        if (dirtyText) {
+          dirtyText = false;
+          setActiveStreamingText(accumulatedText);
+        }
+      };
 
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || trimmed.startsWith(':') || !trimmed.startsWith('data:')) continue;
-          const jsonStr = trimmed.slice(5).trim();
-          if (!jsonStr || jsonStr === '[DONE]') continue;
+      const scheduleStreamingUiFlush = () => {
+        if (uiFlushTimer) return;
+        uiFlushTimer = setTimeout(() => {
+          uiFlushTimer = null;
+          flushStreamingUi();
+        }, 50);
+      };
 
-          let evt: any = null;
+      const waitWithSignal = (ms: number) =>
+        new Promise<void>((resolve, reject) => {
+          if (combinedSignal.aborted) {
+            reject(combinedSignal.reason || new DOMException('Aborted', 'AbortError'));
+            return;
+          }
+          const t = setTimeout(() => {
+            combinedSignal.removeEventListener('abort', onAbort);
+            resolve();
+          }, ms);
+          const onAbort = () => {
+            clearTimeout(t);
+            reject(combinedSignal.reason || new DOMException('Aborted', 'AbortError'));
+          };
+          combinedSignal.addEventListener('abort', onAbort, { once: true });
+        });
+
+      const readStreamLeg = async (
+        resp: Response
+      ): Promise<{ handoffResponse: Response | null }> => {
+        if (!resp.body) {
+          throw new Error('No response stream returned from server.');
+        }
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let sseBuffer = '';
+
+        try {
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) {
+              sseBuffer += decoder.decode();
+            } else {
+              sseBuffer += decoder.decode(value, { stream: true });
+            }
+
+            const lines = sseBuffer.split('\n');
+            sseBuffer = done ? '' : lines.pop() || '';
+
+            for (const line of lines) {
+              const trimmed = line.trim();
+              if (!trimmed || trimmed.startsWith(':') || !trimmed.startsWith('data:')) continue;
+              const jsonStr = trimmed.slice(5).trim();
+              if (!jsonStr || jsonStr === '[DONE]') continue;
+
+              let evt: any = null;
+              try {
+                evt = JSON.parse(jsonStr);
+              } catch {
+                continue;
+              }
+
+              if (typeof evt._seq === 'number') {
+                if (evt._seq <= lastProcessedSeq) continue;
+                lastProcessedSeq = evt._seq;
+              }
+
+              if (evt.type === 'handoff') {
+                flushStreamingUi();
+                const handoffJobId =
+                  typeof evt.jobId === 'string' && evt.jobId ? evt.jobId : activeJobId;
+                const afterSeq = lastProcessedSeq;
+                const resumeUrl = `/api/chat/resume?jobId=${encodeURIComponent(handoffJobId)}&afterSeq=${afterSeq}`;
+                const nextRes = await fetch(resumeUrl, {
+                  signal: combinedSignal,
+                  cache: 'no-store',
+                  headers: { Accept: 'text/event-stream' },
+                });
+                if (!nextRes.ok || !nextRes.body) {
+                  const errJson = await nextRes.json().catch(() => null);
+                  throw new Error(errJson?.error || `Stream handoff failed (HTTP ${nextRes.status}).`);
+                }
+                reader.cancel().catch(() => {});
+                reconnectAttempts = 0;
+                return { handoffResponse: nextRes };
+              }
+
+              if (evt.type === 'model_init') {
+                resolvedModel = evt.model;
+                setActiveModelUsed(resolvedModel);
+              } else if (evt.type === 'learned_capability') {
+                if (evt.model && evt.capability && typeof evt.capability === 'object') {
+                  setCapabilitiesCache((prev) => ({
+                    ...prev,
+                    [activeProvider]: {
+                      ...(prev[activeProvider] || {}),
+                      [evt.model]: evt.capability,
+                    },
+                  }));
+                }
+              } else if (evt.type === 'model_meta') {
+                if (typeof evt.appliedSummary === 'string' && evt.appliedSummary.trim()) {
+                  resolvedThinkingMeta =
+                    evt.retried && !evt.appliedSummary.includes('retried')
+                      ? `${evt.appliedSummary.trim()} (retried)`
+                      : evt.appliedSummary.trim();
+                  setActiveThinkingMeta(resolvedThinkingMeta);
+                }
+              } else if (evt.type === 'thinking') {
+                if (!thinkingUiActive) {
+                  thinkingUiActive = true;
+                  setIsThinkingActive(true);
+                }
+              } else if (evt.type === 'thought') {
+                promoteTimeoutToActive();
+                reconnectAttempts = 0;
+                if (!thinkingUiActive) {
+                  thinkingUiActive = true;
+                  setIsThinkingActive(true);
+                }
+                accumulatedThought += evt.text || '';
+                dirtyThought = true;
+                scheduleStreamingUiFlush();
+              } else if (evt.type === 'chunk') {
+                promoteTimeoutToActive();
+                reconnectAttempts = 0;
+                if (thinkingUiActive) {
+                  thinkingUiActive = false;
+                  setIsThinkingActive(false);
+                }
+                accumulatedText += evt.text || '';
+                dirtyText = true;
+                scheduleStreamingUiFlush();
+              } else if (evt.type === 'fallback_notice') {
+                if (uiFlushTimer) {
+                  clearTimeout(uiFlushTimer);
+                  uiFlushTimer = null;
+                }
+                dirtyThought = false;
+                dirtyText = false;
+                accumulatedText = '';
+                accumulatedThought = '';
+                resolvedThinkingMeta = '';
+                thinkingUiActive = false;
+                setIsThinkingActive(false);
+                setActiveStreamingText('');
+                setActiveStreamingThought('');
+                setActiveThinkingMeta('');
+                resolvedModel = evt.nextModel || resolvedModel;
+                setActiveModelUsed(resolvedModel);
+                setFallbackNotice(
+                  `Switched from ${evt.failedModel} → ${evt.nextModel} (${evt.reason || 'fallback'})`
+                );
+              } else if (evt.type === 'done') {
+                flushStreamingUi();
+                terminalEventSeen = true;
+                if (evt.modelUsed) {
+                  resolvedModel = evt.modelUsed;
+                  setActiveModelUsed(resolvedModel);
+                }
+                return { handoffResponse: null };
+              } else if (evt.type === 'error') {
+                flushStreamingUi();
+                terminalEventSeen = true;
+                throw new Error(evt.error || 'Upstream model error.');
+              }
+            }
+
+            if (done) break;
+          }
+
+          flushStreamingUi();
+          return { handoffResponse: null };
+        } finally {
+          reader.cancel().catch(() => {});
+        }
+      };
+
+      try {
+        while (currentResponse && !terminalEventSeen) {
+          if (combinedSignal.aborted) {
+            throw combinedSignal.reason || new DOMException('Aborted', 'AbortError');
+          }
+
           try {
-            evt = JSON.parse(jsonStr);
-          } catch {
-            continue;
-          }
+            const { handoffResponse } = await readStreamLeg(currentResponse);
+            if (handoffResponse) {
+              currentResponse = handoffResponse;
+              reconnectAttempts = 0;
+              continue;
+            }
+            currentResponse = null;
+            if (terminalEventSeen) break;
+            throw new Error('Stream closed before completion.');
+          } catch (legErr: any) {
+            if (
+              terminalEventSeen ||
+              isUserAbortedRef.current ||
+              combinedSignal.aborted ||
+              legErr?.name === 'AbortError' ||
+              legErr?.name === 'TimeoutError'
+            ) {
+              throw legErr;
+            }
 
-          if (evt.type === 'model_init') {
-            resolvedModel = evt.model;
-            setActiveModelUsed(resolvedModel);
-          } else if (evt.type === 'learned_capability') {
-            if (evt.model && evt.capability && typeof evt.capability === 'object') {
-              setCapabilitiesCache((prev) => ({
-                ...prev,
-                [activeProvider]: {
-                  ...(prev[activeProvider] || {}),
-                  [evt.model]: evt.capability,
-                },
-              }));
+            let resumedResp: Response | null = null;
+            let lastResumeErr: any = legErr;
+
+            while (reconnectAttempts < RECONNECT_BACKOFFS.length) {
+              const delayMs = RECONNECT_BACKOFFS[reconnectAttempts++];
+              await waitWithSignal(delayMs);
+              try {
+                const resumeUrl = `/api/chat/resume?jobId=${encodeURIComponent(activeJobId)}&afterSeq=${lastProcessedSeq}`;
+                const candidateResp = await fetch(resumeUrl, {
+                  signal: combinedSignal,
+                  cache: 'no-store',
+                  headers: { Accept: 'text/event-stream' },
+                });
+                if (candidateResp.status === 404) {
+                  const expiredErr = new Error('Stream session expired on server.') as Error & {
+                    fatal?: boolean;
+                  };
+                  expiredErr.fatal = true;
+                  throw expiredErr;
+                }
+                if (!candidateResp.ok || !candidateResp.body) {
+                  const errJson = await candidateResp.json().catch(() => null);
+                  throw new Error(errJson?.error || `Resume failed (HTTP ${candidateResp.status}).`);
+                }
+                resumedResp = candidateResp;
+                break;
+              } catch (retryErr: any) {
+                if (
+                  retryErr?.fatal ||
+                  isUserAbortedRef.current ||
+                  combinedSignal.aborted ||
+                  retryErr?.name === 'AbortError' ||
+                  retryErr?.name === 'TimeoutError'
+                ) {
+                  throw retryErr;
+                }
+                lastResumeErr = retryErr;
+              }
             }
-          } else if (evt.type === 'model_meta') {
-            if (typeof evt.appliedSummary === 'string' && evt.appliedSummary.trim()) {
-              resolvedThinkingMeta = evt.retried && !evt.appliedSummary.includes('retried')
-                ? `${evt.appliedSummary.trim()} (retried)`
-                : evt.appliedSummary.trim();
-              setActiveThinkingMeta(resolvedThinkingMeta);
+
+            if (!resumedResp) {
+              throw lastResumeErr;
             }
-          } else if (evt.type === 'thinking') {
-            setIsThinkingActive(true);
-          } else if (evt.type === 'thought') {
-            promoteTimeoutToActive();
-            setIsThinkingActive(true);
-            accumulatedThought += evt.text || '';
-            setActiveStreamingThought(accumulatedThought);
-          } else if (evt.type === 'chunk') {
-            promoteTimeoutToActive();
-            setIsThinkingActive(false);
-            accumulatedText += evt.text || '';
-            setActiveStreamingText(accumulatedText);
-          } else if (evt.type === 'fallback_notice') {
-            accumulatedText = '';
-            accumulatedThought = '';
-            resolvedThinkingMeta = '';
-            setActiveStreamingText('');
-            setActiveStreamingThought('');
-            setActiveThinkingMeta('');
-            resolvedModel = evt.nextModel || resolvedModel;
-            setActiveModelUsed(resolvedModel);
-            setFallbackNotice(
-              `Switched from ${evt.failedModel} → ${evt.nextModel} (${evt.reason || 'fallback'})`
-            );
-          } else if (evt.type === 'done') {
-            if (evt.modelUsed) {
-              resolvedModel = evt.modelUsed;
-              setActiveModelUsed(resolvedModel);
-            }
-          } else if (evt.type === 'error') {
-            throw new Error(evt.error || 'Upstream model error.');
+            currentResponse = resumedResp;
           }
+        }
+      } finally {
+        if (uiFlushTimer) {
+          clearTimeout(uiFlushTimer);
+          uiFlushTimer = null;
         }
       }
 
