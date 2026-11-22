@@ -68,8 +68,8 @@ app.use(express.urlencoded({ limit: '30mb', extended: true }));
 // sets a 7-day HttpOnly cookie; /api/* without it gets 401 JSON.
 // Change PW to rotate the password (change KEY too). No client code changes.
 // ============================================================================
-const PW = 'solarauniversa';
-const KEY = 'solara-9f4c2e77ab13'; // random cookie value, moves with PW
+const PW = 'change this ';
+const KEY = 'change this too '; // random cookie value, moves with PW
 
 app.use((req, res, next) => {
   if (req.path === '/api/unlock' && req.method === 'POST') {
